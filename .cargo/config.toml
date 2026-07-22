@@ -1,3 +1,10 @@
 [target.aarch64-linux-android]
 linker = "D:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android24-clang.cmd"
 ar = "D:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+
+[alias]
+build-all = "build --release --target x86_64-pc-windows-msvc --target aarch64-linux-android"
+
+[env]
+CC_aarch64_linux_android = "D:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android24-clang.cmd"
+AR_aarch64_linux_android = "D:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
