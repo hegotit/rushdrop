@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+    <title>RushDrop</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            padding: 16px;
+            background: #f8f9fa;
+            color: #1e293b;
+            max-width: 600px;
+            margin: 0 auto;
+            line-height: 1.5;
+        }
+
+        h2 {
+            font-size: 1.6rem;
+            margin-top: 1.2rem;
+            margin-bottom: 0.8rem;
+            color: #0f172a;
+            font-weight: 600;
+        }
+
+        form {
+            background: #ffffff;
+            padding: 20px 16px;
+            border-radius: 16px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+            margin-bottom: 2rem;
+        }
+
+        input[type="file"] {
+            display: block;
+            width: 100%;
+            padding: 14px 12px;
+            font-size: 1rem;
+            border: 1.5px solid #d1d5db;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            background: #fafafa;
+            transition: border-color 0.2s;
+            min-height: 56px;
+        }
+
+        input[type="file"]:focus {
+            border-color: #007aff;
+            outline: none;
+            background: #fff;
+        }
+
+        button[type="submit"] {
+            width: 100%;
+            padding: 16px 20px;
+            font-size: 1.25rem;
+            font-weight: 600;
+            background: #007aff;
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        button[type="submit"]:active {
+            transform: scale(0.97);
+            background: #005bb5;
+        }
+
+        button[type="submit"]:hover {
+            background: #005bb5;
+        }
+
+        button[type="submit"]:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .copy-btn {
+            display: inline-block;
+            padding: 8px 16px;
+            font-size: 1rem;
+            font-weight: 500;
+            background: #e9ecef;
+            color: #1e293b;
+            border: 1px solid #d1d5db;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            margin-bottom: 12px;
+        }
+
+        .copy-btn:active {
+            transform: scale(0.97);
+            background: #d1d5db;
+        }
+
+        .copy-btn:hover {
+            background: #dee2e6;
+        }
+
+        /* 待上传列表 */
+        #upload-preview {
+            margin-top: 16px;
+            padding: 0;
+            list-style: none;
+        }
+
+        #upload-preview li {
+            background: #f1f5f9;
+            padding: 10px 14px;
+            border-radius: 10px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 0.95rem;
+        }
+
+        #upload-preview .file-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        #upload-preview .file-name {
+            font-weight: 500;
+        }
+
+        #upload-preview .file-size {
+            color: #64748b;
+            font-size: 0.85rem;
+        }
+
+        #upload-preview .status {
+            font-size: 0.9rem;
+            white-space: nowrap;
+            margin-left: 8px;
+        }
+
+        /* 已有文件列表 */
+        ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        li {
+            background: white;
+            padding: 14px 18px;
+            margin-bottom: 12px;
+            border-radius: 14px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px 12px;
+            transition: background 0.15s;
+        }
+
+        li a {
+            text-decoration: none;
+            color: #007aff;
+            font-size: 1.05rem;
+            word-break: break-all;
+            flex: 1;
+            min-width: 100px;
+        }
+
+        li .file-size {
+            color: #64748b;
+            font-size: 0.9rem;
+        }
+
+        li .delete-btn {
+            background: none;
+            border: none;
+            font-size: 1.2rem;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 8px;
+            transition: background 0.2s;
+            color: #dc2626;
+            touch-action: manipulation;
+        }
+
+        li .delete-btn:hover {
+            background: #fee2e2;
+        }
+
+        li .delete-btn:active {
+            background: #fecaca;
+        }
+
+        .file-list-title {
+            margin-top: 1.8rem;
+        }
+
+        @media (max-width: 480px) {
+            body {
+                padding: 12px;
+            }
+
+            h2 {
+                font-size: 1.4rem;
+            }
+
+            form {
+                padding: 16px 12px;
+            }
+
+            input[type="file"] {
+                padding: 12px 10px;
+                font-size: 0.95rem;
+                min-height: 48px;
+            }
+
+            button[type="submit"] {
+                padding: 14px 16px;
+                font-size: 1.1rem;
+            }
+
+            li {
+                padding: 12px 14px;
+            }
+
+            li a {
+                font-size: 1rem;
+            }
+        }
+
+        @media (min-width: 768px) {
+            body {
+                padding: 32px;
+            }
+
+            form {
+                padding: 28px 32px;
+            }
+
+            li {
+                padding: 16px 22px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <h2>📤 上传文件</h2>
+    <button id="copy-link-btn" class="copy-btn">📋 复制链接</button>
+    <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" id="file-input" multiple>
+        <button type="submit" id="upload-btn">上传</button>
+        <ul id="upload-preview"></ul>
+    </form>
+
+    <h2 class="file-list-title">📂 {device_title}</h2>
+    <ul id="file-list">{}</ul>
+
+    <script>
+        (function () {
+            "use strict";
+
+            const fileInput = document.getElementById('file-input');
+            const uploadBtn = document.getElementById('upload-btn');
+            const previewList = document.getElementById('upload-preview');
+            const fileListUl = document.getElementById('file-list');
+
+            // ---------- 工具 ----------
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 B';
+                const units = ['B', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(1024));
+                const val = (bytes / Math.pow(1024, i)).toFixed(1);
+                return val + ' ' + units[i];
+            }
+
+            function createPreviewItem(file) {
+                const li = document.createElement('li');
+                const info = document.createElement('span');
+                info.className = 'file-info';
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'file-name';
+                nameSpan.textContent = file.name;
+                const sizeSpan = document.createElement('span');
+                sizeSpan.className = 'file-size';
+                sizeSpan.textContent = `(${formatFileSize(file.size)})`;
+                info.appendChild(nameSpan);
+                info.appendChild(sizeSpan);
+
+                const status = document.createElement('span');
+                status.className = 'status';
+                status.textContent = '⏳ 等待中';
+                li.appendChild(info);
+                li.appendChild(status);
+                return li;
+            }
+
+            function updatePreview() {
+                previewList.innerHTML = '';
+                const files = fileInput.files;
+                if (files.length === 0) {
+                    previewList.style.display = 'none';
+                    return;
+                }
+                previewList.style.display = 'block';
+                for (let i = 0; i < files.length; i++) {
+                    const li = createPreviewItem(files[i]);
+                    previewList.appendChild(li);
+                }
+            }
+
+            function getStatusElements() {
+                return previewList.querySelectorAll('.status');
+            }
+
+            function setStatus(index, text) {
+                const items = getStatusElements();
+                if (index < items.length) {
+                    items[index].textContent = text;
+                }
+            }
+
+            function disableUploadButton() {
+                uploadBtn.disabled = true;
+                uploadBtn.textContent = '上传中...';
+            }
+
+            // ---------- 轮询进度 ----------
+            function startPolling(filename, fileSize, statusEl) {
+                let intervalId = null;
+
+                const update = async () => {
+                    try {
+                        const resp = await fetch(`/progress/${encodeURIComponent(filename)}`);
+                        if (!resp.ok) {
+                            if (resp.status === 404) {
+                                // 进度已移除，停止轮询
+                                stopPolling();
+                            }
+                            return;
+                        }
+                        const data = await resp.json();
+                        const progressBytes = data.progress || 0;
+                        const percent = Math.min(100, Math.round((progressBytes / fileSize) * 100));
+                        // 仅当状态仍为“上传中”时才更新百分比
+                        if (statusEl.textContent.startsWith('⬆️ 上传中')) {
+                            statusEl.textContent = `⬆️ 上传中 ${percent}%`;
+                        }
+                    } catch (_) {
+                        // 网络错误忽略，继续轮询
+                    }
+                };
+
+                const stopPolling = () => {
+                    if (intervalId) {
+                        clearInterval(intervalId);
+                        intervalId = null;
+                    }
+                };
+
+                // 立即执行一次
+                update();
+                // 每秒轮询
+                intervalId = setInterval(update, 1000);
+
+                return stopPolling;
+            }
+
+            // ---------- 上传逻辑 ----------
+            async function uploadFiles() {
+                const files = fileInput.files;
+                if (files.length === 0) {
+                    alert('请先选择文件');
+                    return;
+                }
+
+                disableUploadButton();
+
+                const statusEls = getStatusElements();
+                for (let i = 0; i < statusEls.length; i++) {
+                    statusEls[i].textContent = '⏳ 等待中';
+                }
+
+                const tasks = [];
+                for (let i = 0; i < files.length; i++) {
+                    const file = files[i];
+                    const statusEl = statusEls[i];
+                    const filename = file.name;
+                    const fileSize = file.size;
+
+                    const task = (async () => {
+                        // 设置为上传中，启动轮询
+                        statusEl.textContent = '⬆️ 上传中 0%';
+                        const stopPolling = startPolling(filename, fileSize, statusEl);
+
+                        const formData = new FormData();
+                        formData.append('file', file);
+
+                        try {
+                            const response = await fetch('/upload', {
+                                method: 'POST',
+                                body: formData,
+                            });
+                            stopPolling(); // 停止轮询
+                            if (response.ok) {
+                                statusEl.textContent = '✅ 完成';
+                            } else {
+                                statusEl.textContent = '❌ 失败';
+                            }
+                        } catch (err) {
+                            stopPolling();
+                            statusEl.textContent = '❌ 失败';
+                        }
+                    })();
+                    tasks.push(task);
+                }
+
+                await Promise.allSettled(tasks);
+                location.reload(); // 刷新文件列表
+            }
+
+            // ---------- 删除文件 ----------
+            async function deleteFile(filename, liElement) {
+                if (!confirm(`确定要删除“${filename}”吗？`)) {
+                    return;
+                }
+                try {
+                    const response = await fetch(`/delete/${encodeURIComponent(filename)}`, {
+                        method: 'DELETE',
+                    });
+                    if (response.ok) {
+                        if (liElement && liElement.parentNode) {
+                            liElement.remove();
+                        }
+                    } else {
+                        let errMsg = '删除失败';
+                        try {
+                            const json = await response.json();
+                            if (json && json.message) {
+                                errMsg = json.message;
+                            }
+                        } catch (_) { /* ignore */ }
+                        alert(`删除失败: ${errMsg}`);
+                    }
+                } catch (err) {
+                    alert(`删除失败: ${err.message || '网络错误'}`);
+                }
+            }
+
+            // ---------- 事件绑定 ----------
+            fileInput.addEventListener('change', updatePreview);
+
+            document.getElementById('copy-link-btn').addEventListener('click', async function () {
+                const btn = this;
+                try {
+                    await navigator.clipboard.writeText(window.location.href);
+                    const originalText = btn.textContent;
+                    btn.textContent = '✅ 已复制';
+                    setTimeout(() => {
+                        btn.textContent = originalText;
+                    }, 2000);
+                } catch (_) {
+                    // 静默失败，不影响其他功能
+                }
+            });
+
+            document.getElementById('upload-form').addEventListener('submit', function (e) {
+                e.preventDefault();
+                uploadFiles();
+            });
+
+            fileListUl.addEventListener('click', function (e) {
+                const btn = e.target.closest('.delete-btn');
+                if (!btn) return;
+                const filename = btn.getAttribute('data-filename');
+                if (!filename) return;
+                const li = btn.closest('li');
+                deleteFile(filename, li);
+            });
+
+            // 初始预览
+            updatePreview();
+        })();
+    </script>
+</body>
+
+</html>
