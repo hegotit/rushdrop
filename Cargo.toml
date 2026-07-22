@@ -1,0 +1,17 @@
+[package]
+name = "rushdrop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart"] }   # 开启 multipart
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "limit"] }
+axum-extra = { version = "0.9", features = ["multipart"] }   # 如果你还用了 axum-extra 的 multipart，可以保留
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+qr2term = "0.3"              # 终端打印彩色二维码
+local-ip-address = "0.6"     # 获取本机局域网 IP
+anyhow = "1"                 # 简易错误处理
+mime_guess = "2"             # 猜测文件 MIME 类型
+# qrcode-generator = "4"  # 不再需要，qr2term 内部已包含
