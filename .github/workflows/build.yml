@@ -1,0 +1,307 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: rushdrop-windows-x86_64
+            artifact_ext: .exe
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: rushdrop-linux-x86_64
+            artifact_ext: ''
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact_name: rushdrop-macos-aarch64
+            artifact_ext: ''
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            artifact_name: rushdrop-android-aarch64
+            artifact_ext: ''
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ---------- 通用 Rust 环境 ----------
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Cache cargo registry and build
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "build-${{ matrix.target }}"
+
+      # ---------- Android 专用环境配置 ----------
+      - name: Set up Android NDK (for aarch64-linux-android, require API >= 24)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          LINKER=$(find $SDK_ROOT -name "aarch64-linux-android24-clang" 2>/dev/null | head -n 1)
+          if [ -z "$LINKER" ]; then
+            echo "⚠️ 未找到 android24，尝试搜索 android25~34..."
+            LINKER=$(find $SDK_ROOT -name "aarch64-linux-android[2-9][0-9]-clang" -o -name "aarch64-linux-android3[0-9]-clang" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$LINKER" ]; then
+            echo "❌ 错误：找不到 API 24 或更高版本的 Android 链接器！"
+            exit 1
+          fi
+          echo "✅ 找到符合要求的链接器 (API >= 24): $LINKER"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$LINKER" >> $GITHUB_ENV
+
+          AR=$(find $SDK_ROOT -name "llvm-ar" 2>/dev/null | head -n 1)
+          if [ -z "$AR" ]; then
+            echo "❌ 错误：找不到 llvm-ar！"
+            exit 1
+          fi
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$AR" >> $GITHUB_ENV
+          echo "CC_aarch64_linux_android=$LINKER" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$AR" >> $GITHUB_ENV
+
+          NDK_PATH=${LINKER%/toolchains/llvm/prebuilt/linux-x86_64/bin/*}
+          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
+        shell: bash
+
+      # ---------- 交叉编译 libheif 及依赖 (Android) ----------
+      - name: Cache Android libheif (installed)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: actions/cache@v4
+        id: cache-android-libheif
+        with:
+          path: ~/android-libs
+          key: ubuntu-android-libheif-v1
+
+      - name: Build libde265 and libheif for Android
+        if: matrix.target == 'aarch64-linux-android' && steps.cache-android-libheif.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          PREFIX="$HOME/android-libs"
+          mkdir -p "$PREFIX"
+          export PATH="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
+
+          # 仅设置编译器，不额外添加 CFLAGS/LDFLAGS
+          export CC="aarch64-linux-android24-clang"
+          export CXX="aarch64-linux-android24-clang++"
+          export AR="llvm-ar"
+          export RANLIB="llvm-ranlib"
+          export LD="ld.lld"
+
+          # ===== 编译 libde265 =====
+          cd /tmp
+          git clone --depth 1 --branch v1.0.15 https://github.com/strukturag/libde265.git
+          cd libde265
+          ./autogen.sh
+          ./configure --host=aarch64-linux-android \
+                      --prefix="$PREFIX" \
+                      --disable-shared --enable-static
+          make -j$(nproc)
+          make install
+
+          # ===== 编译 libheif =====
+          cd /tmp
+          git clone --depth 1 --branch v1.23.1 https://github.com/strukturag/libheif.git
+          cd libheif
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DWITH_X265=OFF \
+            -DWITH_DAV1D=OFF \
+            -DWITH_RAV1E=OFF \
+            -DWITH_LIBDE265=ON \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DCMAKE_PREFIX_PATH="$PREFIX"
+          make -j$(nproc)
+          make install
+
+          # 修正 pkg-config 路径
+          sed -i 's|^prefix=.*|prefix='"$PREFIX"'|g' "$PREFIX/lib/pkgconfig/libheif.pc"
+          sed -i 's|^exec_prefix=.*|exec_prefix=${prefix}|g' "$PREFIX/lib/pkgconfig/libheif.pc"
+          echo "✅ libheif 编译完成，安装至 $PREFIX"
+        shell: bash
+
+      # ---------- Linux 自包含编译 libheif 及依赖 ----------
+      - name: Cache Linux libheif (installed)
+        if: matrix.os == 'ubuntu-latest' && matrix.target != 'aarch64-linux-android'
+        uses: actions/cache@v4
+        id: cache-linux-libheif
+        with:
+          path: ~/libheif-install
+          key: ${{ runner.os }}-libheif-1.23.1-v1
+
+      - name: Build libde265 and libheif for Linux
+        if: matrix.os == 'ubuntu-latest' && matrix.target != 'aarch64-linux-android' && steps.cache-linux-libheif.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          PREFIX="$HOME/libheif-install"
+          mkdir -p "$PREFIX"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+
+          cd /tmp
+          git clone --depth 1 --branch v1.0.15 https://github.com/strukturag/libde265.git
+          cd libde265
+          ./autogen.sh
+          ./configure --prefix="$PREFIX" --disable-shared --enable-static
+          make -j$(nproc)
+          make install
+
+          cd /tmp
+          git clone --depth 1 --branch v1.23.1 https://github.com/strukturag/libheif.git
+          cd libheif
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DWITH_X265=OFF \
+            -DWITH_DAV1D=OFF \
+            -DWITH_RAV1E=OFF \
+            -DWITH_LIBDE265=ON \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DCMAKE_PREFIX_PATH="$PREFIX"
+          make -j$(nproc)
+          make install
+
+          sed -i 's|^prefix=.*|prefix='"$PREFIX"'|g' "$PREFIX/lib/pkgconfig/libheif.pc"
+          sed -i 's|^exec_prefix=.*|exec_prefix=${prefix}|g' "$PREFIX/lib/pkgconfig/libheif.pc"
+          echo "✅ libheif 编译完成，安装至 $PREFIX"
+        shell: bash
+
+      # ---------- macOS 安装 libheif ----------
+      - name: Install libheif (macOS)
+        if: matrix.os == 'macos-14'
+        run: brew install libheif
+
+      # ---------- Windows 安装 libheif (vcpkg 缓存) ----------
+      - name: Cache vcpkg installed libraries (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/cache@v4
+        id: cache-vcpkg
+        with:
+          path: ./vcpkg/installed
+          key: ${{ runner.os }}-vcpkg-libheif-v1
+
+      - name: Setup vcpkg and install libheif (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          if (Test-Path "./vcpkg/installed/x64-windows-static-md/lib/heif.lib") {
+            Write-Host "✅ vcpkg libheif 缓存命中，跳过安装"
+            New-Item -ItemType File -Path "./vcpkg/.vcpkg-root" -Force | Out-Null
+            $vcpkgRoot = "$(Get-Location)\vcpkg"
+            echo "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo $vcpkgRoot | Out-File -FilePath $env:GITHUB_PATH -Append
+            exit 0
+          }
+          git clone https://github.com/Microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          .\vcpkg\vcpkg install libheif:x64-windows-static-md
+          $vcpkgRoot = "$(Get-Location)\vcpkg"
+          echo "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo $vcpkgRoot | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # ---------- 构建二进制 ----------
+      - name: Build release binary (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          export PKG_CONFIG_PATH="$HOME/libheif-install/lib/pkgconfig"
+          export LIBHEIF_DIR="$HOME/libheif-install"
+          export LIBHEIF_STATIC=1
+          export RUSTFLAGS="-L $HOME/libheif-install/lib -lstdc++ -lde265"
+          cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Build release binary (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Build release binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          LIBHEIF_STATIC: 1
+          VCPKG_TARGET_TRIPLET: x64-windows-static-md
+
+      - name: Build release binary (Android)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          export PKG_CONFIG_PATH="$HOME/android-libs/lib/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export LIBHEIF_DIR="$HOME/android-libs"
+          export LIBHEIF_STATIC=1
+          export RUSTFLAGS="-L $HOME/android-libs/lib -lc++_static -lc++abi -lunwind"
+          cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      # ---------- 收集并重命名产物 ----------
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          SOURCE="target/${{ matrix.target }}/release/rushdrop${{ matrix.artifact_ext }}"
+          DEST="rushdrop-${{ matrix.artifact_name }}${{ matrix.artifact_ext }}"
+          cp "$SOURCE" "$DEST"
+          echo "ASSET_NAME=$DEST" >> $GITHUB_ENV
+
+      - name: Upload artifact to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: rushdrop-${{ matrix.artifact_name }}${{ matrix.artifact_ext }}
+          path: rushdrop-${{ matrix.artifact_name }}${{ matrix.artifact_ext }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: List files
+        run: ls -lR artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
