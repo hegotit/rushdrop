@@ -268,8 +268,8 @@
         <ul id="upload-preview"></ul>
     </form>
 
-    <h2 class="file-list-title">📂 {device_title}</h2>
-    <ul id="file-list">{}</ul>
+    <h2 class="file-list-title">📂 {{ device_title }}</h2>
+    <ul id="file-list">{{ file_list|safe }}</ul>
 
     <script>
         (function () {

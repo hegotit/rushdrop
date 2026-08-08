@@ -1,3 +1,4 @@
+use askama::Template;
 use axum::{
     Router,
     body::Body,
@@ -32,9 +33,14 @@ use tracing::subscriber::set_global_default;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
 
-const INDEX_HTML: &str = include_str!("../templates/index.html");
-
 const THUMB_EXT: &str = "webp";
+
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTemplate {
+    device_title: String,
+    file_list: String,
+}
 
 struct AppState {
     files_dir: PathBuf,
@@ -300,22 +306,15 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
 
     entries.sort_by(|a, b| b.0.cmp(&a.0));
 
-    for (_, name, _) in &entries {
-        if is_image(name) {
-            let files_dir_clone = files_dir.clone();
-            let semaphore = state.thumb_semaphore.clone();
-            spawn_thumbnail(files_dir_clone, name.to_owned(), semaphore);
-        }
-    }
-
     for (_, name, size) in entries {
+        let is_img = is_image(&name);
         let size_str = format_size(size);
         let safe_name = name
             .replace('"', "&quot;")
             .replace('<', "&lt;")
             .replace('>', "&gt;");
 
-        let thumbnail_html = if is_image(&name) {
+        let thumbnail_html = if is_img {
             format!(
                 r#"<img src="/thumb/{}" loading="lazy" width="80" height="80" style="object-fit:cover;border-radius:4px;" onerror="setTimeout(()=>this.src='/thumb/{}?'+Date.now(), 1000); this.onerror=null;">"#,
                 safe_name, safe_name
@@ -333,6 +332,12 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
         </li>"#,
             thumbnail_html, safe_name, safe_name, size_str, safe_name
         ));
+
+        if is_img {
+            let files_dir_clone = files_dir.clone();
+            let semaphore = state.thumb_semaphore.clone();
+            spawn_thumbnail(files_dir_clone, name, semaphore);
+        }
     }
 
     let device_title = match consts::OS {
@@ -343,11 +348,15 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
         _ => "设备上的文件",
     };
 
-    let html = INDEX_HTML
-        .replace("{device_title}", device_title)
-        .replace("{}", &file_list_html);
-
-    Html(html)
+    let template = IndexTemplate {
+        device_title: device_title.into(),
+        file_list: file_list_html,
+    };
+    let rendered = template.render().unwrap_or_else(|e| {
+        error!("模板渲染失败: {}", e);
+        "模板渲染错误".to_string()
+    });
+    Html(rendered)
 }
 
 async fn upload(
