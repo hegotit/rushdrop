@@ -1,0 +1,95 @@
+name: Build Android Libs
+
+on:
+  workflow_dispatch:   # 仅手动触发
+
+jobs:
+  build-libs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Android NDK
+        run: |
+          SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          LINKER=$(find $SDK_ROOT -name "aarch64-linux-android24-clang" 2>/dev/null | head -n 1)
+          if [ -z "$LINKER" ]; then
+            echo "⚠️ 未找到 android24，尝试搜索 android25~34..."
+            LINKER=$(find $SDK_ROOT -name "aarch64-linux-android[2-9][0-9]-clang" -o -name "aarch64-linux-android3[0-9]-clang" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$LINKER" ]; then
+            echo "❌ 错误：找不到 API 24 或更高版本的 Android 链接器！"
+            exit 1
+          fi
+          echo "✅ 找到符合要求的链接器 (API >= 24): $LINKER"
+          NDK_PATH=${LINKER%/toolchains/llvm/prebuilt/linux-x86_64/bin/*}
+          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Cache Android libheif (installed)
+        uses: actions/cache@v4
+        id: cache-android-libheif
+        with:
+          path: ~/android-libs
+          key: ubuntu-android-libheif-v1
+
+      - name: Build libde265 and libheif
+        if: steps.cache-android-libheif.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          PREFIX="$HOME/android-libs"
+          mkdir -p "$PREFIX"
+          export PATH="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
+
+          # 仅设置编译器，不额外添加 CFLAGS/LDFLAGS
+          export CC="aarch64-linux-android24-clang"
+          export CXX="aarch64-linux-android24-clang++"
+          export AR="llvm-ar"
+          export RANLIB="llvm-ranlib"
+          export LD="ld.lld"
+
+          # ===== 编译 libde265 =====
+          cd /tmp
+          git clone --depth 1 --branch v1.0.15 https://github.com/strukturag/libde265.git
+          cd libde265
+          ./autogen.sh
+          ./configure --host=aarch64-linux-android \
+                      --prefix="$PREFIX" \
+                      --disable-shared --enable-static
+          make -j$(nproc)
+          make install
+
+          # ===== 编译 libheif =====
+          cd /tmp
+          git clone --depth 1 --branch v1.23.1 https://github.com/strukturag/libheif.git
+          cd libheif
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DWITH_X265=OFF \
+            -DWITH_DAV1D=OFF \
+            -DWITH_RAV1E=OFF \
+            -DWITH_LIBDE265=ON \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DCMAKE_PREFIX_PATH="$PREFIX"
+          make -j$(nproc)
+          make install
+
+          # 修正 pkgconfig 前缀
+          sed -i 's|^prefix=.*|prefix='"$PREFIX"'|g' "$PREFIX/lib/pkgconfig/libheif.pc"
+          echo "✅ 静态库编译完成，已保存至缓存"
+        shell: bash
+
+      - name: Upload static libraries as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-libs-aarch64
+          path: ~/android-libs
+          if-no-files-found: error
