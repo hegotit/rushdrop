@@ -1,7 +1,7 @@
 use askama::Template;
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Request, State},
     http::StatusCode,
     response::Response,
@@ -201,7 +201,7 @@ fn is_image(filename: &str) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic"
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif"
     )
 }
 
@@ -227,7 +227,7 @@ fn generate_thumbnail_sync(orig_path: &Path, thumb_path: &Path) -> anyhow::Resul
         .unwrap_or("")
         .to_lowercase();
 
-    let img = if ext == "heic" {
+    let img = if ext == "heic" || ext == "heif" {
         let lib_heif = LibHeif::new();
         let path_str = orig_path
             .to_str()
@@ -360,29 +360,24 @@ async fn upload(
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            let msg = "缺少 Content-Type 头".to_string();
-            error!("{}", msg);
-            (StatusCode::BAD_REQUEST, msg)
-        })?;
-
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "缺少 Content-Type 头".to_string()))?;
     let boundary = parse_boundary(content_type).map_err(|e| {
-        let msg = format!("解析 boundary 失败: {}", e);
-        error!("{}", msg);
-        (StatusCode::BAD_REQUEST, msg)
+        (
+            StatusCode::BAD_REQUEST,
+            format!("解析 boundary 失败: {}", e),
+        )
     })?;
 
-    let size_limit = SizeLimit::new()
-        .whole_stream(1024 * 1024 * 1024)
-        .per_field(1024 * 1024 * 1024);
+    let constraints = Constraints::new().size_limit(
+        SizeLimit::new()
+            .whole_stream(1024 * 1024 * 1024)
+            .per_field(1024 * 1024 * 1024),
+    );
 
-    let constraints = Constraints::new().size_limit(size_limit);
+    let mut multipart =
+        Multipart::with_constraints(req.into_body().into_data_stream(), boundary, constraints);
 
-    let body_stream = req.into_body().into_data_stream();
-    let mut multipart = Multipart::with_constraints(body_stream, boundary, constraints);
-
-    let save_dir = &state.files_dir;
-    let canonical_base = dunce::canonicalize(save_dir).map_err(|e| {
+    let canonical_base = dunce::canonicalize(&state.files_dir).map_err(|e| {
         let msg = format!("服务器路径规范化失败: {}", e);
         error!("{}", msg);
         (StatusCode::INTERNAL_SERVER_ERROR, msg)
@@ -395,29 +390,10 @@ async fn upload(
         error!("{}", err_msg);
         (StatusCode::BAD_REQUEST, err_msg)
     })? {
-        let raw_name = if let Some(name) = field.file_name() {
-            name.to_string()
-        } else {
-            let file_extension = field.content_type().and_then(|mime| {
-                if mime.type_() == "image" && mime.subtype() == "heic" {
-                    return Some("heic");
-                }
-                mime_guess::get_mime_extensions(mime).and_then(|exts| exts.first().copied())
-            });
+        let (file_name, first_chunk) = generate_filename_from_field(&mut field).await?;
+        let progress_entry = ProgressEntry::new(progress_map.clone(), file_name.clone());
 
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let ext = file_extension
-                .map(|e| format!(".{}", e))
-                .unwrap_or_default();
-            format!("unnamed_{}{}", now, ext)
-        };
-
-        let progress_entry = ProgressEntry::new(progress_map.clone(), raw_name.clone());
-
-        let safe_name = sanitize(&raw_name);
+        let safe_name = sanitize(&file_name);
         let file_path = canonical_base.join(&safe_name);
 
         let mut file = fs::File::create(&file_path).await.map_err(|e| {
@@ -430,11 +406,25 @@ async fn upload(
         let mut last_updated = 0;
         const UPDATE_THRESHOLD: usize = 64 * 1024;
 
+        if let Some(data) = first_chunk {
+            file.write_all(&data).await.map_err(|e| {
+                let err_msg = format!("创建文件 '{}' 第一块失败: {}", file_path.display(), e);
+                error!("{}", err_msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, err_msg)
+            })?;
+            total_bytes += data.len();
+
+            if total_bytes - last_updated >= UPDATE_THRESHOLD {
+                progress_entry.update(total_bytes);
+                last_updated = total_bytes;
+            }
+        }
+
         while let Some(chunk_result) = field.next().await {
             let chunk = chunk_result.map_err(|e| {
                 let err_msg = format!(
                     "读取文件 '{}' 数据块失败 (已接收 {} 字节): {}",
-                    raw_name, total_bytes, e
+                    file_name, total_bytes, e
                 );
                 error!("{}", err_msg);
                 if e.to_string().contains("limit") {
@@ -469,7 +459,7 @@ async fn upload(
 
         info!(
             "✅ 上传成功: {} ({} 字节) -> {}",
-            raw_name,
+            file_name,
             total_bytes,
             file_path.display()
         );
@@ -478,6 +468,69 @@ async fn upload(
     Ok(Html(
         "<p>上传成功</p><p><a href='/'>返回首页</a></p>".to_string(),
     ))
+}
+
+async fn generate_filename_from_field(
+    field: &mut multer::Field<'_>,
+) -> Result<(String, Option<Bytes>), (StatusCode, String)> {
+    let provided_name = field.file_name().map(|s| s.to_string());
+    let content_type = field.content_type();
+
+    let has_extension = provided_name
+        .as_ref()
+        .and_then(|name| Path::new(name).extension())
+        .is_some();
+
+    let need_magic_check = !has_extension
+        && content_type.map_or(false, |m| {
+            m.type_() == "application" && m.subtype() == "octet-stream"
+        });
+
+    let (use_provided_name, base_name) = match provided_name {
+        Some(name) if !name.is_empty() => (true, name),
+        _ => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            (false, format!("unnamed_{}", now))
+        }
+    };
+
+    if need_magic_check {
+        match field.next().await {
+            Some(Ok(chunk)) => {
+                let ext = infer::Infer::new().get(&chunk).map(|kind| kind.extension());
+                let final_name = if let Some(ext) = ext {
+                    format!("{}.{}", base_name, ext)
+                } else {
+                    base_name
+                };
+                Ok((final_name, Some(chunk)))
+            }
+            Some(Err(e)) => {
+                let err_msg = format!("读取第一个数据块失败: {}", e);
+                error!("{}", err_msg);
+                Err((StatusCode::BAD_REQUEST, err_msg))
+            }
+            None => Ok((base_name, None)),
+        }
+    } else {
+        if use_provided_name {
+            Ok((base_name, None))
+        } else {
+            let final_name = if let Some(ext) = content_type
+                .and_then(|mime| mime_guess::get_mime_extensions(mime))
+                .and_then(|exts| exts.first())
+                .copied()
+            {
+                format!("{}.{}", base_name, ext)
+            } else {
+                base_name
+            };
+            Ok((final_name, None))
+        }
+    }
 }
 
 async fn progress_handler(
