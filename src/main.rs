@@ -3,7 +3,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Path as AxumPath, Request, State},
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_TYPE},
     response::Response,
     response::{Html, Json},
     routing::{delete, get, post},
@@ -19,7 +19,7 @@ use sanitize_filename::sanitize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::env::{consts, current_dir};
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -193,6 +193,12 @@ fn thumb_dir(files_dir: &Path) -> PathBuf {
     files_dir.parent().unwrap_or(files_dir).join("thumbnails")
 }
 
+async fn ensure_thumb_dir(files_dir: &Path) -> Result<PathBuf, Error> {
+    let dir = thumb_dir(files_dir);
+    fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
 fn is_image(filename: &str) -> bool {
     let ext = Path::new(filename)
         .extension()
@@ -265,16 +271,20 @@ fn spawn_thumbnail(files_dir: PathBuf, filename: String, semaphore: Arc<Semaphor
             return;
         };
 
-        let orig_path = files_dir.join(&filename);
-        let thumb_dir = thumb_dir(&files_dir);
-        if let Err(e) = fs::create_dir_all(&thumb_dir).await {
-            error!("创建缩略图目录失败: {}", e);
-            return;
-        }
+        let thumb_dir = match ensure_thumb_dir(&files_dir).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                error!("创建缩略图目录失败: {}", e);
+                return;
+            }
+        };
+
         let thumb_path = thumb_dir.join(&filename).with_extension(THUMB_EXT);
         if thumb_path.exists() {
             return;
         }
+
+        let orig_path = files_dir.join(&filename);
         let result =
             tokio::task::spawn_blocking(move || generate_thumbnail_sync(&orig_path, &thumb_path))
                 .await;
@@ -358,14 +368,23 @@ async fn upload(
 ) -> Result<Html<String>, (StatusCode, String)> {
     let content_type = req
         .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "缺少 Content-Type 头".to_string()))?;
+        .get(CONTENT_TYPE)
+        .ok_or_else(|| {
+            let msg = "缺少 Content-Type 头".to_string();
+            error!("{}", msg);
+            (StatusCode::BAD_REQUEST, msg)
+        })?
+        .to_str()
+        .map_err(|e| {
+            let msg = format!("Content-Type 头包含非 UTF-8 字符: {}", e);
+            error!("{}", msg);
+            (StatusCode::BAD_REQUEST, msg)
+        })?;
+
     let boundary = parse_boundary(content_type).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("解析 boundary 失败: {}", e),
-        )
+        let msg = format!("解析 boundary 失败: {}", e);
+        error!("{}", msg);
+        (StatusCode::BAD_REQUEST, msg)
     })?;
 
     let constraints = Constraints::new().size_limit(
@@ -579,7 +598,7 @@ async fn delete_file(
             info!("文件删除成功: {}", filename);
             Ok(Json(json!({ "success": true })))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
             let msg = format!("文件不存在: {}", filename);
             error!("{}", msg);
             Err((StatusCode::NOT_FOUND, msg))
@@ -596,8 +615,11 @@ async fn thumb_handler(
     AxumPath(filename): AxumPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, (StatusCode, String)> {
-    let thumb_dir = thumb_dir(&state.files_dir);
-    let thumb_path = thumb_dir.join(&filename).with_extension(THUMB_EXT);
+    let thumb_dir = ensure_thumb_dir(&state.files_dir).await.map_err(|e| {
+        let msg = format!("创建缩略图目录失败: {}", e);
+        error!("{}", msg);
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
 
     let canonical_base = dunce::canonicalize(&thumb_dir).map_err(|e| {
         let msg = format!("缩略图目录规范化失败: {}", e);
@@ -605,6 +627,7 @@ async fn thumb_handler(
         (StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
 
+    let thumb_path = thumb_dir.join(&filename).with_extension(THUMB_EXT);
     if thumb_path.strip_prefix(&canonical_base).is_err() {
         let msg = "路径遍历攻击尝试 (缩略图)".to_string();
         error!("{}: {}", msg, filename);
