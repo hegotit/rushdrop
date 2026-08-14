@@ -501,18 +501,18 @@ async fn generate_filename_from_field(
         .is_some();
 
     let need_magic_check = !has_extension
-        && content_type.map_or(false, |m| {
+        && content_type.map_or(true, |m| {
             m.type_() == "application" && m.subtype() == "octet-stream"
         });
 
-    let (use_provided_name, base_name) = match provided_name {
-        Some(name) if !name.is_empty() => (true, name),
+    let base_name = match provided_name {
+        Some(name) if !name.is_empty() => name,
         _ => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
-            (false, format!("unnamed_{}", now))
+            format!("unnamed_{}", now)
         }
     };
 
@@ -535,20 +535,21 @@ async fn generate_filename_from_field(
             None => Ok((base_name, None)),
         }
     } else {
-        if use_provided_name {
-            Ok((base_name, None))
-        } else {
-            let final_name = if let Some(ext) = content_type
+        let final_name = if !has_extension
+            && let Some(ext) = content_type
                 .and_then(|mime| mime_guess::get_mime_extensions(mime))
-                .and_then(|exts| exts.first())
-                .copied()
-            {
-                format!("{}.{}", base_name, ext)
-            } else {
-                base_name
-            };
-            Ok((final_name, None))
-        }
+                .and_then(|exts| {
+                    if exts.contains(&"jpg") {
+                        Some("jpg")
+                    } else {
+                        exts.first().copied()
+                    }
+                }) {
+            format!("{}.{}", base_name, ext)
+        } else {
+            base_name
+        };
+        Ok((final_name, None))
     }
 }
 
