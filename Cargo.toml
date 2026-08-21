@@ -15,7 +15,7 @@ enable-ansi-support = "0.3"
 futures = "0.3"
 image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 infer = "0.22"
-libheif-rs = { version = "2.7.0" }
+libheif-rs = { version = "3" }
 local-ip-address = "0.6"
 mime_guess = "2"
 multer = "3.1"
