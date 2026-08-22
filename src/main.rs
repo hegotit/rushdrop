@@ -4,8 +4,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path as AxumPath, Request, State},
     http::{StatusCode, header::CONTENT_TYPE},
-    response::Response,
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -19,11 +18,12 @@ use sanitize_filename::sanitize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::env::{consts, current_dir};
-use std::io::{Error, ErrorKind, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use supports_color::Stream;
+use thiserror::Error;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -34,6 +34,63 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
 
 const THUMB_EXT: &str = "webp";
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("缺少 Content-Type 头")]
+    MissingContentType,
+    #[error("Content-Type 头包含非 UTF-8 字符: {0}")]
+    InvalidContentType(#[from] axum::http::header::ToStrError),
+    #[error("multipart 处理错误: {0}")]
+    MulterError(#[from] multer::Error),
+    #[error("文件 I/O 错误: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("路径遍历攻击")]
+    PathTraversal,
+    #[error("文件不存在: {0}")]
+    NotFound(String),
+    #[error("内部错误: {0}")]
+    Internal(String),
+    #[error("缩略图尚未生成，请稍后重试")]
+    ThumbnailNotReady,
+
+    #[error("获取锁失败")]
+    LockError,
+}
+
+// 将 anyhow::Error 转换为 AppError（用于缩略图生成等场景）
+impl From<anyhow::Error> for AppError {
+    fn from(e: anyhow::Error) -> Self {
+        AppError::Internal(e.to_string())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            AppError::MissingContentType => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::InvalidContentType(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::MulterError(ref e) => {
+                let status = match e {
+                    multer::Error::FieldSizeExceeded { .. }
+                    | multer::Error::StreamSizeExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                    _ => StatusCode::BAD_REQUEST,
+                };
+                (status, self.to_string())
+            }
+            AppError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            AppError::PathTraversal => (StatusCode::FORBIDDEN, self.to_string()),
+            AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            AppError::ThumbnailNotReady => (StatusCode::NOT_FOUND, self.to_string()),
+            AppError::LockError => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        };
+        // 统一记录错误日志
+        error!("请求错误: {} (状态码 {})", msg, status);
+        (status, msg).into_response()
+    }
+}
 
 #[derive(Template)]
 #[template(path = "index.html")]
@@ -53,13 +110,10 @@ struct AppState {
 struct Cli {
     #[arg(short, long, default_value_t = 3000)]
     port: u16,
-
     #[arg(short, long)]
     dir: Option<PathBuf>,
-
     #[arg(short, long, default_value_t = 300)]
     timeout: u64,
-
     #[arg(short = 's', long, default_value_t = false)]
     https: bool,
 }
@@ -193,7 +247,7 @@ fn thumb_dir(files_dir: &Path) -> PathBuf {
     files_dir.parent().unwrap_or(files_dir).join("thumbnails")
 }
 
-async fn ensure_thumb_dir(files_dir: &Path) -> Result<PathBuf, Error> {
+async fn ensure_thumb_dir(files_dir: &Path) -> Result<PathBuf, std::io::Error> {
     let dir = thumb_dir(files_dir);
     fs::create_dir_all(&dir).await?;
     Ok(dir)
@@ -365,27 +419,14 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
 async fn upload(
     State(state): State<Arc<AppState>>,
     req: Request,
-) -> Result<Html<String>, (StatusCode, String)> {
+) -> Result<Html<String>, AppError> {
     let content_type = req
         .headers()
         .get(CONTENT_TYPE)
-        .ok_or_else(|| {
-            let msg = "缺少 Content-Type 头".to_string();
-            error!("{}", msg);
-            (StatusCode::BAD_REQUEST, msg)
-        })?
-        .to_str()
-        .map_err(|e| {
-            let msg = format!("Content-Type 头包含非 UTF-8 字符: {}", e);
-            error!("{}", msg);
-            (StatusCode::BAD_REQUEST, msg)
-        })?;
+        .ok_or(AppError::MissingContentType)?
+        .to_str()?; // 自动转换为 AppError::InvalidContentType
 
-    let boundary = parse_boundary(content_type).map_err(|e| {
-        let msg = format!("解析 boundary 失败: {}", e);
-        error!("{}", msg);
-        (StatusCode::BAD_REQUEST, msg)
-    })?;
+    let boundary = parse_boundary(content_type)?; // 自动转换为 AppError::MulterError
 
     let constraints = Constraints::new().size_limit(
         SizeLimit::new()
@@ -396,83 +437,42 @@ async fn upload(
     let mut multipart =
         Multipart::with_constraints(req.into_body().into_data_stream(), boundary, constraints);
 
-    let canonical_base = dunce::canonicalize(&state.files_dir).map_err(|e| {
-        let msg = format!("服务器路径规范化失败: {}", e);
-        error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
+    let canonical_base = dunce::canonicalize(&state.files_dir)?; // 自动转换为 AppError::Io
 
     let progress_map = state.upload_progress.clone();
 
-    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
-        let err_msg = format!("读取 multipart 字段失败: {}", e);
-        error!("{}", err_msg);
-        (StatusCode::BAD_REQUEST, err_msg)
-    })? {
+    while let Some(mut field) = multipart.next_field().await? {
         let (file_name, first_chunk) = generate_filename_from_field(&mut field).await?;
         let progress_entry = ProgressEntry::new(progress_map.clone(), file_name.clone());
 
         let safe_name = sanitize(&file_name);
         let file_path = canonical_base.join(&safe_name);
 
-        let mut file = fs::File::create(&file_path).await.map_err(|e| {
-            let err_msg = format!("创建文件 '{}' 失败: {}", file_path.display(), e);
-            error!("{}", err_msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, err_msg)
-        })?;
+        let mut file = fs::File::create(&file_path).await?;
 
         let mut total_bytes = 0;
         let mut last_updated = 0;
         const UPDATE_THRESHOLD: usize = 64 * 1024;
 
         if let Some(data) = first_chunk {
-            file.write_all(&data).await.map_err(|e| {
-                let err_msg = format!("创建文件 '{}' 第一块失败: {}", file_path.display(), e);
-                error!("{}", err_msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, err_msg)
-            })?;
+            file.write_all(&data).await?;
             total_bytes += data.len();
-
             if total_bytes - last_updated >= UPDATE_THRESHOLD {
                 progress_entry.update(total_bytes);
                 last_updated = total_bytes;
             }
         }
 
-        while let Some(chunk_result) = field.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                let err_msg = format!(
-                    "读取文件 '{}' 数据块失败 (已接收 {} 字节): {}",
-                    file_name, total_bytes, e
-                );
-                error!("{}", err_msg);
-                if e.to_string().contains("limit") {
-                    (StatusCode::PAYLOAD_TOO_LARGE, err_msg)
-                } else {
-                    (StatusCode::BAD_REQUEST, err_msg)
-                }
-            })?;
-
-            file.write_all(&chunk).await.map_err(|e| {
-                let err_msg = format!("写入文件 '{}' 失败: {}", file_path.display(), e);
-                error!("{}", err_msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, err_msg)
-            })?;
-
+        while let Some(chunk) = field.next().await.transpose()? {
+            file.write_all(&chunk).await?;
             total_bytes += chunk.len();
-
             if total_bytes - last_updated >= UPDATE_THRESHOLD {
                 progress_entry.update(total_bytes);
                 last_updated = total_bytes;
             }
         }
 
-        file.flush().await.map_err(|e| {
-            let err_msg = format!("刷新文件 '{}' 失败: {}", file_path.display(), e);
-            error!("{}", err_msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, err_msg)
-        })?;
-
+        file.flush().await?;
         progress_entry.update(total_bytes);
         drop(progress_entry);
 
@@ -491,7 +491,7 @@ async fn upload(
 
 async fn generate_filename_from_field(
     field: &mut multer::Field<'_>,
-) -> Result<(String, Option<Bytes>), (StatusCode, String)> {
+) -> Result<(String, Option<Bytes>), AppError> {
     let provided_name = field.file_name().map(|s| s.to_string());
     let content_type = field.content_type();
 
@@ -517,26 +517,21 @@ async fn generate_filename_from_field(
     };
 
     if need_magic_check {
-        match field.next().await {
-            Some(Ok(chunk)) => {
-                let ext = infer::Infer::new().get(&chunk).map(|kind| kind.extension());
-                let final_name = if let Some(ext) = ext {
-                    format!("{}.{}", base_name, ext)
-                } else {
-                    base_name
-                };
-                Ok((final_name, Some(chunk)))
-            }
-            Some(Err(e)) => {
-                let err_msg = format!("读取第一个数据块失败: {}", e);
-                error!("{}", err_msg);
-                Err((StatusCode::BAD_REQUEST, err_msg))
-            }
-            None => Ok((base_name, None)),
+        let chunk = field.next().await.transpose()?; // 自动转换为 AppError::MulterError
+        if let Some(chunk) = chunk {
+            let ext = infer::Infer::new().get(&chunk).map(|kind| kind.extension());
+            let final_name = if let Some(ext) = ext {
+                format!("{}.{}", base_name, ext)
+            } else {
+                base_name
+            };
+            Ok((final_name, Some(chunk)))
+        } else {
+            Ok((base_name, None))
         }
     } else {
-        let final_name = if !has_extension
-            && let Some(ext) = content_type
+        let final_name = if !has_extension {
+            if let Some(ext) = content_type
                 .and_then(|mime| mime_guess::get_mime_extensions(mime))
                 .and_then(|exts| {
                     if exts.contains(&"jpg") {
@@ -544,8 +539,12 @@ async fn generate_filename_from_field(
                     } else {
                         exts.first().copied()
                     }
-                }) {
-            format!("{}.{}", base_name, ext)
+                })
+            {
+                format!("{}.{}", base_name, ext)
+            } else {
+                base_name
+            }
         } else {
             base_name
         };
@@ -556,38 +555,30 @@ async fn generate_filename_from_field(
 async fn progress_handler(
     AxumPath(filename): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let map = state.upload_progress.lock().map_err(|_| {
-        error!("获取进度锁失败");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+) -> Result<Json<serde_json::Value>, AppError> {
+    let map = state
+        .upload_progress
+        .lock()
+        .map_err(|_| AppError::LockError)?;
     if let Some(&progress) = map.get(&filename) {
         Ok(Json(json!({ "progress": progress })))
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(AppError::NotFound(filename))
     }
 }
 
 async fn delete_file(
     State(state): State<Arc<AppState>>,
     AxumPath(filename): AxumPath<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let file_path = state.files_dir.join(&filename);
 
-    let canonical_base = dunce::canonicalize(&state.files_dir).map_err(|e| {
-        let msg = format!("服务器路径规范化失败: {}", e);
-        error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
-    let canonical_full = dunce::canonicalize(&file_path).map_err(|_| {
-        let msg = "无效的文件路径".to_string();
-        error!("{}", msg);
-        (StatusCode::BAD_REQUEST, msg)
-    })?;
+    let canonical_base = dunce::canonicalize(&state.files_dir)?;
+    let canonical_full =
+        dunce::canonicalize(&file_path).map_err(|_| AppError::NotFound(filename.clone()))?;
+
     if !canonical_full.starts_with(&canonical_base) {
-        let msg = "路径遍历攻击尝试".to_string();
-        error!("路径遍历攻击尝试: {}", filename);
-        return Err((StatusCode::FORBIDDEN, msg));
+        return Err(AppError::PathTraversal);
     }
 
     match fs::remove_file(&file_path).await {
@@ -599,69 +590,37 @@ async fn delete_file(
             info!("文件删除成功: {}", filename);
             Ok(Json(json!({ "success": true })))
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            let msg = format!("文件不存在: {}", filename);
-            error!("{}", msg);
-            Err((StatusCode::NOT_FOUND, msg))
-        }
-        Err(e) => {
-            let msg = format!("删除文件失败: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
-        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Err(AppError::NotFound(filename)),
+        Err(e) => Err(e.into()),
     }
 }
 
 async fn thumb_handler(
     AxumPath(filename): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> Result<Response, (StatusCode, String)> {
-    let thumb_dir = ensure_thumb_dir(&state.files_dir).await.map_err(|e| {
-        let msg = format!("创建缩略图目录失败: {}", e);
-        error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
+) -> Result<Response, AppError> {
+    let thumb_dir = ensure_thumb_dir(&state.files_dir).await?;
 
-    let canonical_base = dunce::canonicalize(&thumb_dir).map_err(|e| {
-        let msg = format!("缩略图目录规范化失败: {}", e);
-        error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
-
+    let canonical_base = dunce::canonicalize(&thumb_dir)?;
     let thumb_path = thumb_dir.join(&filename).with_extension(THUMB_EXT);
     if thumb_path.strip_prefix(&canonical_base).is_err() {
-        let msg = "路径遍历攻击尝试 (缩略图)".to_string();
-        error!("{}: {}", msg, filename);
-        return Err((StatusCode::FORBIDDEN, msg));
+        return Err(AppError::PathTraversal);
     }
 
     if !thumb_path.exists() {
         let files_dir = state.files_dir.clone();
         let semaphore = state.thumb_semaphore.clone();
         spawn_thumbnail(files_dir, filename, semaphore);
-        return Err((StatusCode::NOT_FOUND, "缩略图未生成".to_string()));
+        return Err(AppError::ThumbnailNotReady);
     }
 
-    match fs::read(&thumb_path).await {
-        Ok(data) => {
-            let mime = mime_guess::from_path(&thumb_path).first_or_octet_stream();
-            let body = Body::from(data);
-            let response = Response::builder()
-                .header("Content-Type", mime.as_ref())
-                .body(body)
-                .map_err(|e| {
-                    let msg = format!("构建响应失败: {}", e);
-                    error!("{}", msg);
-                    (StatusCode::INTERNAL_SERVER_ERROR, msg)
-                })?;
-            Ok(response)
-        }
-        Err(e) => {
-            let msg = format!("读取缩略图失败: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
-        }
-    }
+    let data = fs::read(&thumb_path).await?;
+    let mime = mime_guess::from_path(&thumb_path).first_or_octet_stream();
+    let body = Body::from(data);
+    Response::builder()
+        .header("Content-Type", mime.as_ref())
+        .body(body)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 async fn start_http(addr: String, app: Router) -> anyhow::Result<()> {

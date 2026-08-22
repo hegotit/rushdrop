@@ -2120,6 +2120,7 @@ dependencies = [
  "sanitize-filename",
  "serde_json",
  "supports-color",
+ "thiserror",
  "tokio",
  "tower-http",
  "tracing",
