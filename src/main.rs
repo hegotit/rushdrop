@@ -235,7 +235,45 @@ fn get_files_dir() -> anyhow::Result<PathBuf> {
     };
 
     if let Some(dir) = selected_dir {
-        info!("已选择公共存储目录: {}", dir.display());
+        // 如果选择了 Pictures，尝试列出其子目录
+        if let Some(pictures_dir) = options.iter().find(|(name, _)| *name == "Pictures") {
+            let pictures_path = storage_dir.join(pictures_dir.1);
+            if pictures_path.is_dir() {
+                // 读取子目录（只取目录，忽略文件）
+                let subdirs: Vec<_> = std::fs::read_dir(&pictures_path)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .filter(|e| e.path().is_dir())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+
+                if !subdirs.is_empty() {
+                    println!("\n检测到 Pictures 下有以下子目录：");
+                    for (idx, name) in subdirs.iter().enumerate() {
+                        println!("  {}. {}", idx + 1, name);
+                    }
+                    println!("  {}. 使用 Pictures 根目录", subdirs.len() + 1);
+
+                    let mut choice = String::new();
+                    std::io::stdin().read_line(&mut choice)?;
+
+                    if let Ok(num) = choice.trim().parse::<usize>() {
+                        if num >= 1 && num <= subdirs.len() {
+                            let final_dir = pictures_path.join(&subdirs[num - 1]);
+                            info!("已选择子目录: {}", final_dir.display());
+                            return Ok(final_dir);
+                        }
+                    }
+                    // 输入无效或选择“使用根目录”时，保持原目录
+                }
+            }
+        }
+        // 正常返回选中的目录
         Ok(dir)
     } else {
         warn!("无效选择，回退到默认存储目录。");
@@ -251,6 +289,15 @@ async fn ensure_thumb_dir(files_dir: &Path) -> Result<PathBuf, std::io::Error> {
     let dir = thumb_dir(files_dir);
     fs::create_dir_all(&dir).await?;
     Ok(dir)
+}
+
+fn thumb_base_name(files_dir: &Path, filename: &str) -> String {
+    let canonical = dunce::canonicalize(files_dir).unwrap_or_else(|_| files_dir.to_path_buf());
+    let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+    // 取前 16 个十六进制字符（64 位），碰撞概率极低，且保持文件名短小
+    let hash_hex = hash.to_hex().to_string();
+    let short_hash = &hash_hex[..16];
+    format!("{}_{}", short_hash, filename)
 }
 
 fn is_image(filename: &str) -> bool {
@@ -333,7 +380,8 @@ fn spawn_thumbnail(files_dir: PathBuf, filename: String, semaphore: Arc<Semaphor
             }
         };
 
-        let thumb_path = thumb_dir.join(&filename).with_extension(THUMB_EXT);
+        let thumb_name = thumb_base_name(&files_dir, &filename);
+        let thumb_path = thumb_dir.join(thumb_name).with_extension(THUMB_EXT);
         if thumb_path.exists() {
             return;
         }
@@ -583,8 +631,9 @@ async fn delete_file(
 
     match fs::remove_file(&file_path).await {
         Ok(_) => {
+            let thumb_name = thumb_base_name(&state.files_dir, &filename);
             let thumb_path = thumb_dir(&state.files_dir)
-                .join(&filename)
+                .join(thumb_name)
                 .with_extension(THUMB_EXT);
             let _ = fs::remove_file(thumb_path).await;
             info!("文件删除成功: {}", filename);
@@ -602,7 +651,8 @@ async fn thumb_handler(
     let thumb_dir = ensure_thumb_dir(&state.files_dir).await?;
 
     let canonical_base = dunce::canonicalize(&thumb_dir)?;
-    let thumb_path = thumb_dir.join(&filename).with_extension(THUMB_EXT);
+    let thumb_name = thumb_base_name(&state.files_dir, &filename);
+    let thumb_path = thumb_dir.join(thumb_name).with_extension(THUMB_EXT);
     if thumb_path.strip_prefix(&canonical_base).is_err() {
         return Err(AppError::PathTraversal);
     }
