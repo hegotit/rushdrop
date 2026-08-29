@@ -605,10 +605,17 @@ async fn progress_handler(
         .lock()
         .map_err(|_| AppError::LockError)?;
     if let Some(&progress) = map.get(&filename) {
-        Ok(Json(json!({ "progress": progress })))
-    } else {
-        Err(AppError::NotFound(filename))
+        return Ok(Json(
+            json!({ "progress": progress , "status": "uploading" }),
+        ));
     }
+
+    let file_path = state.files_dir.join(&filename);
+    if file_path.exists() {
+        return Ok(Json(json!({ "progress": 100, "status": "done" })));
+    }
+
+    Ok(Json(json!({ "progress": 0, "status": "pending" })))
 }
 
 async fn delete_file(
