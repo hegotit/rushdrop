@@ -234,37 +234,38 @@ fn get_files_dir() -> anyhow::Result<PathBuf> {
     };
 
     if let Some(dir) = selected_dir {
-        // 如果选择了 Pictures，尝试列出其子目录
-        if let Some(pictures_dir) = options.iter().find(|(name, _)| *name == "Pictures") {
-            let pictures_path = storage_dir.join(pictures_dir.1);
-            if pictures_path.is_dir() {
-                let subdirs: Vec<_> = std::fs::read_dir(&pictures_path)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|entries| {
-                        entries
-                            .filter_map(Result::ok)
-                            .filter(|e| e.path().is_dir())
-                            .map(|e| e.file_name().to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
+        if dir == storage_dir.join("pictures") {
+            if let Some(pictures_dir) = options.iter().find(|(name, _)| *name == "Pictures") {
+                let pictures_path = storage_dir.join(pictures_dir.1);
+                if pictures_path.is_dir() {
+                    let subdirs: Vec<_> = std::fs::read_dir(&pictures_path)
+                        .ok()
+                        .into_iter()
+                        .flat_map(|entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .filter(|e| e.path().is_dir())
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
 
-                if !subdirs.is_empty() {
-                    println!("\n检测到 Pictures 下有以下子目录：");
-                    for (idx, name) in subdirs.iter().enumerate() {
-                        println!("  {}. {}", idx + 1, name);
-                    }
-                    println!("  {}. 使用 Pictures 根目录", subdirs.len() + 1);
+                    if !subdirs.is_empty() {
+                        println!("\n检测到 Pictures 下有以下子目录：");
+                        for (idx, name) in subdirs.iter().enumerate() {
+                            println!("  {}. {}", idx + 1, name);
+                        }
+                        println!("  {}. 使用 Pictures 根目录", subdirs.len() + 1);
 
-                    let mut choice = String::new();
-                    std::io::stdin().read_line(&mut choice)?;
+                        let mut choice = String::new();
+                        std::io::stdin().read_line(&mut choice)?;
 
-                    if let Ok(num) = choice.trim().parse::<usize>() {
-                        if num >= 1 && num <= subdirs.len() {
-                            let final_dir = pictures_path.join(&subdirs[num - 1]);
-                            info!("已选择子目录: {}", final_dir.display());
-                            return Ok(final_dir);
+                        if let Ok(num) = choice.trim().parse::<usize>() {
+                            if num >= 1 && num <= subdirs.len() {
+                                let final_dir = pictures_path.join(&subdirs[num - 1]);
+                                info!("已选择子目录: {}", final_dir.display());
+                                return Ok(final_dir);
+                            }
                         }
                     }
                 }
