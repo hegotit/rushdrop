@@ -59,7 +59,6 @@ pub enum AppError {
     LockError,
 }
 
-// 将 anyhow::Error 转换为 AppError（用于缩略图生成等场景）
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
         AppError::Internal(e.to_string())
@@ -86,7 +85,6 @@ impl IntoResponse for AppError {
             AppError::ThumbnailNotReady => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::LockError => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
-        // 统一记录错误日志
         error!("请求错误: {} (状态码 {})", msg, status);
         (status, msg).into_response()
     }
@@ -101,6 +99,7 @@ struct IndexTemplate {
 
 struct AppState {
     files_dir: PathBuf,
+    thumb_dir: PathBuf,
     upload_progress: Arc<Mutex<HashMap<String, usize>>>,
     thumb_semaphore: Arc<Semaphore>,
 }
@@ -239,7 +238,6 @@ fn get_files_dir() -> anyhow::Result<PathBuf> {
         if let Some(pictures_dir) = options.iter().find(|(name, _)| *name == "Pictures") {
             let pictures_path = storage_dir.join(pictures_dir.1);
             if pictures_path.is_dir() {
-                // 读取子目录（只取目录，忽略文件）
                 let subdirs: Vec<_> = std::fs::read_dir(&pictures_path)
                     .ok()
                     .into_iter()
@@ -269,11 +267,9 @@ fn get_files_dir() -> anyhow::Result<PathBuf> {
                             return Ok(final_dir);
                         }
                     }
-                    // 输入无效或选择“使用根目录”时，保持原目录
                 }
             }
         }
-        // 正常返回选中的目录
         Ok(dir)
     } else {
         warn!("无效选择，回退到默认存储目录。");
@@ -294,7 +290,6 @@ async fn ensure_thumb_dir(files_dir: &Path) -> Result<PathBuf, std::io::Error> {
 fn thumb_base_name(files_dir: &Path, filename: &str) -> String {
     let canonical = dunce::canonicalize(files_dir).unwrap_or_else(|_| files_dir.to_path_buf());
     let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
-    // 取前 16 个十六进制字符（64 位），碰撞概率极低，且保持文件名短小
     let hash_hex = hash.to_hex().to_string();
     let short_hash = &hash_hex[..16];
     format!("{}_{}", short_hash, filename)
@@ -472,9 +467,9 @@ async fn upload(
         .headers()
         .get(CONTENT_TYPE)
         .ok_or(AppError::MissingContentType)?
-        .to_str()?; // 自动转换为 AppError::InvalidContentType
+        .to_str()?;
 
-    let boundary = parse_boundary(content_type)?; // 自动转换为 AppError::MulterError
+    let boundary = parse_boundary(content_type)?;
 
     let constraints = Constraints::new().size_limit(
         SizeLimit::new()
@@ -485,7 +480,7 @@ async fn upload(
     let mut multipart =
         Multipart::with_constraints(req.into_body().into_data_stream(), boundary, constraints);
 
-    let canonical_base = dunce::canonicalize(&state.files_dir)?; // 自动转换为 AppError::Io
+    let canonical_base = dunce::canonicalize(&state.files_dir)?;
 
     let progress_map = state.upload_progress.clone();
 
@@ -565,7 +560,7 @@ async fn generate_filename_from_field(
     };
 
     if need_magic_check {
-        let chunk = field.next().await.transpose()?; // 自动转换为 AppError::MulterError
+        let chunk = field.next().await.transpose()?;
         if let Some(chunk) = chunk {
             let ext = infer::Infer::new().get(&chunk).map(|kind| kind.extension());
             let final_name = if let Some(ext) = ext {
@@ -632,9 +627,7 @@ async fn delete_file(
     match fs::remove_file(&file_path).await {
         Ok(_) => {
             let thumb_name = thumb_base_name(&state.files_dir, &filename);
-            let thumb_path = thumb_dir(&state.files_dir)
-                .join(thumb_name)
-                .with_extension(THUMB_EXT);
+            let thumb_path = state.thumb_dir.join(thumb_name).with_extension(THUMB_EXT);
             let _ = fs::remove_file(thumb_path).await;
             info!("文件删除成功: {}", filename);
             Ok(Json(json!({ "success": true })))
@@ -648,14 +641,8 @@ async fn thumb_handler(
     AxumPath(filename): AxumPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, AppError> {
-    let thumb_dir = ensure_thumb_dir(&state.files_dir).await?;
-
-    let canonical_base = dunce::canonicalize(&thumb_dir)?;
     let thumb_name = thumb_base_name(&state.files_dir, &filename);
-    let thumb_path = thumb_dir.join(thumb_name).with_extension(THUMB_EXT);
-    if thumb_path.strip_prefix(&canonical_base).is_err() {
-        return Err(AppError::PathTraversal);
-    }
+    let thumb_path = state.thumb_dir.join(thumb_name).with_extension(THUMB_EXT);
 
     if !thumb_path.exists() {
         let files_dir = state.files_dir.clone();
@@ -664,13 +651,38 @@ async fn thumb_handler(
         return Err(AppError::ThumbnailNotReady);
     }
 
-    let data = fs::read(&thumb_path).await?;
-    let mime = mime_guess::from_path(&thumb_path).first_or_octet_stream();
+    // 规范化缩略图文件路径，防御符号链接攻击
+    let canonical_thumb = dunce::canonicalize(&thumb_path)
+        .map_err(|e| AppError::Internal(format!("无法规范化缩略图路径: {}", e)))?;
+
+    // 检查缩略图是否真正位于 thumb_dir 内（使用缓存的规范根目录）
+    if !canonical_thumb.starts_with(&state.thumb_dir) {
+        return Err(AppError::PathTraversal);
+    }
+
+    // 读取文件并添加缓存头
+    let data = fs::read(&canonical_thumb).await?;
+    let mime = mime_guess::from_path(&canonical_thumb).first_or_octet_stream();
+
+    // 获取修改时间作为 ETag
+    let metadata = fs::metadata(&canonical_thumb).await?;
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let etag = format!(
+        "\"{:x}-{:x}\"",
+        modified
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        data.len()
+    );
+
     let body = Body::from(data);
-    Response::builder()
+    Ok(Response::builder()
         .header("Content-Type", mime.as_ref())
+        .header("Cache-Control", "public, max-age=86400") // 缓存一天
+        .header("ETag", etag)
         .body(body)
-        .map_err(|e| AppError::Internal(e.to_string()))
+        .map_err(|e| AppError::Internal(e.to_string()))?)
 }
 
 async fn start_http(addr: String, app: Router) -> anyhow::Result<()> {
@@ -763,24 +775,33 @@ async fn main() -> anyhow::Result<()> {
         .with(file_layer);
     set_global_default(subscriber).expect("设置全局日志订阅者失败");
 
-    // 目录
-    let files_dir = if let Some(dir) = cli.dir {
+    // 获取并规范化文件存储目录
+    let files_dir_raw = if let Some(dir) = cli.dir {
         dir
     } else {
         get_files_dir()?
     };
+    let files_dir = dunce::canonicalize(&files_dir_raw).unwrap_or_else(|_| files_dir_raw.into());
 
     if !files_dir.exists() {
         fs::create_dir_all(&files_dir).await?;
     }
 
-    let abs_path = dunce::canonicalize(&files_dir).unwrap_or_else(|_| files_dir.clone());
-    info!("📁 文件存储目录: {}", abs_path.display());
+    // 计算并规范化缩略图目录
+    let thumb_dir_raw = thumb_dir(&files_dir);
+    let thumb_dir = dunce::canonicalize(&thumb_dir_raw).unwrap_or_else(|_| thumb_dir_raw.into());
+    if !thumb_dir.exists() {
+        fs::create_dir_all(&thumb_dir).await?;
+    }
+
+    info!("📁 文件存储目录: {}", files_dir.display());
+    info!("📁 缩略图存储目录: {}", thumb_dir.display());
 
     let thumb_semaphore = Arc::new(Semaphore::new(4));
 
     let state = Arc::new(AppState {
         files_dir: files_dir.clone(),
+        thumb_dir: thumb_dir.into(),
         upload_progress: Arc::new(Mutex::new(HashMap::new())),
         thumb_semaphore,
     });
