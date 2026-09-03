@@ -67,10 +67,10 @@ impl From<anyhow::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
+        let (status, msg) = match &self {
             AppError::MissingContentType => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::InvalidContentType(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            AppError::MulterError(ref e) => {
+            AppError::MulterError(e) => {
                 let status = match e {
                     multer::Error::FieldSizeExceeded { .. }
                     | multer::Error::StreamSizeExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -85,7 +85,13 @@ impl IntoResponse for AppError {
             AppError::ThumbnailNotReady => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::LockError => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
-        error!("请求错误: {} (状态码 {})", msg, status);
+
+        if matches!(&self, AppError::ThumbnailNotReady) {
+            warn!("{}", msg);
+        } else {
+            error!("请求错误: {} (状态码 {})", msg, status);
+        }
+
         (status, msg).into_response()
     }
 }
