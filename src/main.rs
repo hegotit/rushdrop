@@ -218,70 +218,68 @@ fn get_files_dir() -> anyhow::Result<PathBuf> {
     std::io::stdin().read_line(&mut choice)?;
     let choice = choice.trim();
 
-    let selected_dir = if let Ok(num) = choice.parse::<usize>() {
-        if num >= 1 && num <= options.len() {
-            Some(storage_dir.join(options[num - 1].1))
-        } else if num == options.len() + 1 {
-            print!("请输入完整路径: ");
-            Write::flush(&mut std::io::stdout())?;
-            let mut custom = String::new();
-            std::io::stdin().read_line(&mut custom)?;
-            let custom = custom.trim();
-            if custom.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(custom))
-            }
-        } else {
-            None
+    let num = match choice.parse::<usize>() {
+        Ok(n) => n,
+        Err(_) => {
+            warn!("无效选择（非数字），回退到默认存储目录。");
+            return Ok(default_files_dir());
         }
-    } else {
-        None
     };
 
-    if let Some(dir) = selected_dir {
-        if dir == storage_dir.join("pictures") {
-            if let Some(pictures_dir) = options.iter().find(|(name, _)| *name == "Pictures") {
-                let pictures_path = storage_dir.join(pictures_dir.1);
-                if pictures_path.is_dir() {
-                    let subdirs: Vec<_> = std::fs::read_dir(&pictures_path)
-                        .ok()
-                        .into_iter()
-                        .flat_map(|entries| {
-                            entries
-                                .filter_map(Result::ok)
-                                .filter(|e| e.path().is_dir())
-                                .map(|e| e.file_name().to_string_lossy().into_owned())
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
+    let selected_dir = if num >= 1 && num <= options.len() {
+        storage_dir.join(options[num - 1].1)
+    } else if num == options.len() + 1 {
+        print!("请输入完整路径: ");
+        Write::flush(&mut std::io::stdout())?;
+        let mut custom = String::new();
+        std::io::stdin().read_line(&mut custom)?;
+        let custom = custom.trim();
+        if custom.is_empty() {
+            warn!("自定义路径为空，回退到默认存储目录。");
+            return Ok(default_files_dir());
+        }
+        PathBuf::from(custom)
+    } else {
+        warn!("无效编号，回退到默认存储目录。");
+        return Ok(default_files_dir());
+    };
 
-                    if !subdirs.is_empty() {
-                        println!("\n检测到 Pictures 下有以下子目录：");
-                        for (idx, name) in subdirs.iter().enumerate() {
-                            println!("  {}. {}", idx + 1, name);
-                        }
-                        println!("  {}. 使用 Pictures 根目录", subdirs.len() + 1);
+    let is_preset = num >= 1 && num <= options.len();
+    if is_preset && selected_dir.is_dir() {
+        let subdirs: Vec<_> = std::fs::read_dir(&selected_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
-                        let mut choice = String::new();
-                        std::io::stdin().read_line(&mut choice)?;
+        if !subdirs.is_empty() {
+            println!("\n检测到 {} 下有以下子目录：", selected_dir.display());
+            for (idx, name) in subdirs.iter().enumerate() {
+                println!("  {}. {}", idx + 1, name);
+            }
+            println!("  {}. 使用根目录", subdirs.len() + 1);
 
-                        if let Ok(num) = choice.trim().parse::<usize>() {
-                            if num >= 1 && num <= subdirs.len() {
-                                let final_dir = pictures_path.join(&subdirs[num - 1]);
-                                info!("已选择子目录: {}", final_dir.display());
-                                return Ok(final_dir);
-                            }
-                        }
-                    }
+            let mut choice = String::new();
+            std::io::stdin().read_line(&mut choice)?;
+
+            if let Ok(num) = choice.trim().parse::<usize>() {
+                if num >= 1 && num <= subdirs.len() {
+                    let final_dir = selected_dir.join(&subdirs[num - 1]);
+                    info!("已选择子目录: {}", final_dir.display());
+                    return Ok(final_dir);
                 }
             }
         }
-        Ok(dir)
-    } else {
-        warn!("无效选择，回退到默认存储目录。");
-        Ok(default_files_dir())
     }
+
+    info!("使用目录: {}", selected_dir.display());
+    Ok(selected_dir)
 }
 
 fn thumb_dir(files_dir: &Path) -> PathBuf {
