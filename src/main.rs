@@ -35,6 +35,19 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
 
 const THUMB_EXT: &str = "webp";
 
+const PRESET_DIRS: &[(&str, &str)] = &[
+    ("Pictures", "pictures"),
+    ("DCIM", "dcim"),
+    ("Downloads", "downloads"),
+    ("Music", "music"),
+    ("Movies", "movies"),
+];
+
+enum SelectedDir {
+    Preset(PathBuf),
+    Custom(PathBuf),
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("缺少 Content-Type 头")]
@@ -168,115 +181,129 @@ fn default_files_dir() -> PathBuf {
     }
 }
 
-fn get_files_dir() -> anyhow::Result<PathBuf> {
-    if !is_termux() {
-        return Ok(default_files_dir());
-    }
-
-    println!("\n📱 检测到 Termux 环境。是否将文件保存到公共存储目录（如图库、下载等）？");
-    println!("这将使文件在系统文件管理器中直接可见。");
-    print!("输入 y/yes 确认，其他任意键跳过: ");
+fn read_user_input(prompt: &str) -> anyhow::Result<String> {
+    print!("{}", prompt);
     Write::flush(&mut std::io::stdout())?;
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
+    Ok(input.trim().to_string())
+}
 
-    if input != "y" && input != "yes" && input != "ok" {
+fn confirm_use_public_storage() -> anyhow::Result<bool> {
+    let prompt = "\n📱 检测到 Termux 环境。是否将文件保存到公共存储目录（如图库、下载等）？\n这将使文件在系统文件管理器中直接可见。\n输入 y/yes 确认，其他任意键跳过: ";
+    let input = read_user_input(prompt)?;
+    Ok(input == "y" || input == "yes" || input == "ok")
+}
+
+fn select_preset_or_custom_directory(storage_dir: &Path) -> anyhow::Result<SelectedDir> {
+    println!("\n请选择保存目录（输入编号）：");
+    for (i, (name, _)) in PRESET_DIRS.iter().enumerate() {
+        println!("  {}. {}", i + 1, name);
+    }
+    println!("  {}. 自定义路径", PRESET_DIRS.len() + 1);
+
+    let input = read_user_input("")?;
+    let num = input
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("无效数字"))?;
+
+    if num >= 1 && num <= PRESET_DIRS.len() {
+        let path = storage_dir.join(PRESET_DIRS[num - 1].1);
+        Ok(SelectedDir::Preset(path))
+    } else if num == PRESET_DIRS.len() + 1 {
+        let custom = read_user_input("请输入完整路径: ")?;
+        if custom.is_empty() {
+            anyhow::bail!("路径为空");
+        }
+        Ok(SelectedDir::Custom(PathBuf::from(custom)))
+    } else {
+        anyhow::bail!("无效编号");
+    }
+}
+
+fn choose_subdirectory(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+
+    let subdirs = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            warn!("读取目录 {} 失败: {}", dir.display(), e);
+            return Ok(None);
+        }
+    };
+
+    if subdirs.is_empty() {
+        return Ok(None);
+    }
+
+    println!("\n检测到 {} 下有以下子目录：", dir.display());
+    for (idx, name) in subdirs.iter().enumerate() {
+        println!("  {}. {}", idx + 1, name);
+    }
+    println!("  {}. 使用根目录", subdirs.len() + 1);
+
+    let choice = read_user_input("")?;
+    if let Ok(num) = choice.parse::<usize>() {
+        if num >= 1 && num <= subdirs.len() {
+            let final_dir = dir.join(&subdirs[num - 1]);
+            info!("已选择子目录: {}", final_dir.display());
+            return Ok(Some(final_dir));
+        }
+    }
+    Ok(None)
+}
+
+fn get_files_dir() -> anyhow::Result<PathBuf> {
+    let default = default_files_dir();
+    if !is_termux() {
+        return Ok(default);
+    }
+
+    if !confirm_use_public_storage()? {
         info!("使用默认存储目录（Termux 私有空间）");
-        return Ok(default_files_dir());
+        return Ok(default);
     }
 
     let storage_dir = match dirs::home_dir() {
         Some(home) => home.join("storage"),
         None => {
             warn!("无法获取主目录，回退到默认存储");
-            return Ok(default_files_dir());
+            return Ok(default);
         }
     };
 
     if !storage_dir.exists() {
         warn!("未检测到 ~/storage 目录，请先运行 `termux-setup-storage` 授权存储权限。");
         println!("回退到默认存储目录。");
-        return Ok(default_files_dir());
+        return Ok(default);
     }
 
-    let options = [
-        ("Pictures", "pictures"),
-        ("DCIM", "dcim"),
-        ("Downloads", "downloads"),
-        ("Music", "music"),
-        ("Movies", "movies"),
-    ];
-    println!("\n请选择保存目录（输入编号）：");
-    for (i, (name, _)) in options.iter().enumerate() {
-        println!("  {}. {}", i + 1, name);
-    }
-    println!("  {}. 自定义路径", options.len() + 1);
-
-    let mut choice = String::new();
-    std::io::stdin().read_line(&mut choice)?;
-    let choice = choice.trim();
-
-    let num = match choice.parse::<usize>() {
-        Ok(n) => n,
-        Err(_) => {
-            warn!("无效选择（非数字），回退到默认存储目录。");
-            return Ok(default_files_dir());
+    let selected = match select_preset_or_custom_directory(&storage_dir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!("选择目录失败: {}，回退到默认存储目录。", e);
+            return Ok(default);
         }
     };
 
-    let selected_dir = if num >= 1 && num <= options.len() {
-        storage_dir.join(options[num - 1].1)
-    } else if num == options.len() + 1 {
-        print!("请输入完整路径: ");
-        Write::flush(&mut std::io::stdout())?;
-        let mut custom = String::new();
-        std::io::stdin().read_line(&mut custom)?;
-        let custom = custom.trim();
-        if custom.is_empty() {
-            warn!("自定义路径为空，回退到默认存储目录。");
-            return Ok(default_files_dir());
+    let selected_dir = match selected {
+        SelectedDir::Preset(path) => {
+            // 只有预设目录才尝试展开子目录
+            if let Some(subdir) = choose_subdirectory(&path)? {
+                subdir
+            } else {
+                path
+            }
         }
-        PathBuf::from(custom)
-    } else {
-        warn!("无效编号，回退到默认存储目录。");
-        return Ok(default_files_dir());
+        SelectedDir::Custom(path) => path,
     };
-
-    let is_preset = num >= 1 && num <= options.len();
-    if is_preset && selected_dir.is_dir() {
-        let subdirs: Vec<_> = std::fs::read_dir(&selected_dir)
-            .ok()
-            .into_iter()
-            .flat_map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        if !subdirs.is_empty() {
-            println!("\n检测到 {} 下有以下子目录：", selected_dir.display());
-            for (idx, name) in subdirs.iter().enumerate() {
-                println!("  {}. {}", idx + 1, name);
-            }
-            println!("  {}. 使用根目录", subdirs.len() + 1);
-
-            let mut choice = String::new();
-            std::io::stdin().read_line(&mut choice)?;
-
-            if let Ok(num) = choice.trim().parse::<usize>() {
-                if num >= 1 && num <= subdirs.len() {
-                    let final_dir = selected_dir.join(&subdirs[num - 1]);
-                    info!("已选择子目录: {}", final_dir.display());
-                    return Ok(final_dir);
-                }
-            }
-        }
-    }
 
     info!("使用目录: {}", selected_dir.display());
     Ok(selected_dir)
