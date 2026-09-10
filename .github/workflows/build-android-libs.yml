@@ -83,7 +83,11 @@ jobs:
             -DENABLE_TESTS=OFF \
             -DENABLE_EXAMPLES=OFF \
             -DENABLE_PLUGIN_LOADING=NO \
-            -DCMAKE_PREFIX_PATH="$PREFIX"
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DCMAKE_FIND_ROOT_PATH="$PREFIX;$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
           make -j$(nproc)
           make install
 
