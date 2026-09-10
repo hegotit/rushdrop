@@ -82,6 +82,7 @@ jobs:
             -DBUILD_TESTING=OFF \
             -DENABLE_TESTS=OFF \
             -DENABLE_EXAMPLES=OFF \
+            -DENABLE_PLUGIN_LOADING=NO \
             -DCMAKE_PREFIX_PATH="$PREFIX"
           make -j$(nproc)
           make install
