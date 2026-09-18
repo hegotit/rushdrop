@@ -144,7 +144,12 @@ jobs:
             -DBUILD_TESTING=OFF \
             -DENABLE_TESTS=OFF \
             -DENABLE_EXAMPLES=OFF \
-            -DCMAKE_PREFIX_PATH="$PREFIX"
+            -DENABLE_PLUGIN_LOADING=NO \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DCMAKE_FIND_ROOT_PATH="$PREFIX;$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
           make -j$(nproc)
           make install
 
@@ -270,7 +275,7 @@ jobs:
           export PKG_CONFIG_ALLOW_CROSS=1
           export LIBHEIF_DIR="$HOME/android-libs"
           export LIBHEIF_STATIC=1
-          export RUSTFLAGS="-L $HOME/android-libs/lib -lc++_static -lc++abi -lunwind"
+          export RUSTFLAGS="-L $HOME/android-libs/lib -lde265 -lc++_static -lc++abi -lunwind"
           cargo build --release --target ${{ matrix.target }}
         shell: bash
 
