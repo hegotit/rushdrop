@@ -30,7 +30,7 @@ use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 use tower_http::timeout::TimeoutLayer;
 use tracing::subscriber::set_global_default;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
 
 const THUMB_EXT: &str = "webp";
@@ -418,8 +418,8 @@ fn spawn_thumbnail(files_dir: PathBuf, filename: String, semaphore: Arc<Semaphor
             tokio::task::spawn_blocking(move || generate_thumbnail_sync(&orig_path, &thumb_path))
                 .await;
         match result {
-            Ok(Ok(())) => info!("缩略图生成成功: {}", filename),
-            Ok(Err(e)) => error!("生成缩略图失败 {}: {}", filename, e),
+            Ok(Ok(())) => debug!("缩略图生成成功: {}", filename),
+            Ok(Err(e)) => warn!("生成缩略图失败 {}: {}", filename, e),
             Err(e) => error!("spawn_blocking 失败 {}: {}", filename, e),
         }
     });
